@@ -133,32 +133,141 @@ transformed_source_pts = np.asarray(transformed_source.points)
 mesh_path = os.path.join(BASE_DIR, "merged_blade_mapping_big.obj")
 submeshes = trimesh.load_mesh(mesh_path).split()
 
+submeshes_centers = []
+submeshes_radii = []
+intersections = [[] for _ in range(len(submeshes))]
+
+submesh_points = []
 for submesh in submeshes:
     mask = submesh.contains(transformed_source_pts)
     xyz = transformed_source_pts[mask]
+    submesh_points.append(xyz)
 
-    rgb = np.asarray(transformed_source.colors, dtype=np.float32)[mask]
+for submesh in submeshes:
+    center = np.mean(submesh.vertices, axis=0)
+    radius = ((submesh.vertices - center) ** 2).sum(axis=1).max() ** 0.5
+    submeshes_centers.append(center)
+    submeshes_radii.append(radius)
+
+
+for i in range(len(submeshes)):
+    ci = submeshes_centers[i]
+    ri = submeshes_radii[i]
+    for j in range(len(submeshes)):
+        if i == j:
+            continue
+        cj = submeshes_centers[j]
+        rj = submeshes_radii[j]
+
+        if np.linalg.norm(ci - cj) < ri + rj:
+            intersections[i].append(j)
+
+
+for i, submesh in enumerate(submeshes):
+    mask = submesh.contains(transformed_source_pts)
+    xyz_original = transformed_source_pts[mask]
+
+    points_to_keep = np.ones(len(xyz_original), dtype=bool)
+
+    for intersecting_idx in intersections[i]:
+        intersecting_submesh = submeshes[intersecting_idx]
+        intersecting_mask = intersecting_submesh.contains(xyz_original)
+        points_to_keep = points_to_keep & ~intersecting_mask
+
+    xyz_filtered = xyz_original[points_to_keep]
+
+    if len(xyz_filtered) == 0:
+        print(f"Submesh {i}: No points remaining after removing intersections")
+        original_pcd = o3d.geometry.PointCloud()
+        original_pcd.points = o3d.utility.Vector3dVector(xyz_original)
+        original_pcd.paint_uniform_color([0.0, 0.0, 1.0])  # Blue
+        print(f"Submesh {i}: Original points ({len(xyz_original)}) - All removed")
+        o3d.visualization.draw_geometries([original_pcd])
+        continue
+
+    bounds = xyz_original.max(axis=0) - xyz_original.min(axis=0)
+    x_offset = bounds[0] * 1.5
+
+    original_pcd = o3d.geometry.PointCloud()
+    original_pcd.points = o3d.utility.Vector3dVector(xyz_original)
+    original_pcd.paint_uniform_color([0.0, 0.0, 1.0])
+
+    xyz_filtered_offset = xyz_filtered.copy()
+    xyz_filtered_offset[:, 0] += x_offset
+
+    filtered_pcd = o3d.geometry.PointCloud()
+    filtered_pcd.points = o3d.utility.Vector3dVector(xyz_filtered_offset)
+    filtered_pcd.paint_uniform_color([1.0, 0.0, 0.0])
+
+    print(
+        f"Submesh {i}: Left (Blue) = Original ({len(xyz_original)}), Right (Red) = After removal ({len(xyz_filtered)})"
+    )
+    o3d.visualization.draw_geometries([original_pcd, filtered_pcd])
+
+    rgb = np.asarray(transformed_source.colors, dtype=np.float32)[mask][points_to_keep]
 
     rgb_u8 = (rgb * 255).astype(np.uint8)
     hsv = cv2.cvtColor(rgb_u8.reshape(-1, 1, 3), cv2.COLOR_RGB2HSV).reshape(-1, 3)
     H, S, V = hsv[:, 0], hsv[:, 1], hsv[:, 2]
 
     green_mask = (H >= 35) & (H <= 85) & (S >= 60) & (V >= 40)
-    # green_pts = xyz[green_mask]
+    if len(xyz_filtered[green_mask]) == 0:
+        continue
+    db = DBSCAN(eps=0.008, min_samples=40).fit(xyz_filtered[green_mask])
+    labels = db.labels_
+    is_outlier = labels == -1
 
-    # if green_pts.size == 0:
-    #     raise ValueError("No green points found with HSV thresholds. Loosen the mask.")
+    green_inliers_mask = np.zeros(len(xyz_filtered), dtype=bool)
+    green_indices = np.where(green_mask)[0]
+    green_inliers_indices = green_indices[~is_outlier]
+    green_inliers_mask[green_inliers_indices] = True
 
-    # # db = DBSCAN(eps=0.008, min_samples=40).fit(green_pts)
-    # # labels = db.labels_
-    # # is_outlier = labels == -1
+    green_xyz_filtered = xyz_filtered[green_inliers_mask]
 
-    green_cloud = o3d.geometry.PointCloud()
-    green_cloud.points = o3d.utility.Vector3dVector(xyz)
+    filtered_pcd = o3d.geometry.PointCloud()
+    filtered_pcd.points = o3d.utility.Vector3dVector(xyz_filtered)
 
-    colors = np.zeros((len(xyz), 3), dtype=np.float32)
-    colors[green_mask] = [0.0, 1.0, 0.0]
-    colors[~green_mask] = [0.7, 0.7, 0.7]
-    green_cloud.colors = o3d.utility.Vector3dVector(colors)
+    colors = np.zeros((len(xyz_filtered), 3), dtype=np.float32)
 
-    o3d.visualization.draw_geometries([green_cloud])
+    colors[green_inliers_mask] = [0.0, 1.0, 0.0]
+    colors[~green_inliers_mask] = [0.7, 0.7, 0.7]
+    filtered_pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    print(f"Submesh {i}: Green detection on filtered points")
+    o3d.visualization.draw_geometries([filtered_pcd])
+
+    if len(green_xyz_filtered) == 0:
+        continue
+    green_pcd = o3d.geometry.PointCloud()
+    green_pcd.points = o3d.utility.Vector3dVector(green_xyz_filtered)
+
+    hull, _ = green_pcd.compute_convex_hull()
+
+    target_pts = np.asarray(target.points)
+    target_in_submesh_mask = submesh.contains(target_pts)
+    target_pts_in_submesh = target_pts[target_in_submesh_mask]
+
+    if len(target_pts_in_submesh) == 0:
+        print(f"Submesh {i}: No target points found in submesh")
+        continue
+
+    hull_vertices = np.asarray(hull.vertices)
+    hull_triangles = np.asarray(hull.triangles)
+    hull_mesh = trimesh.Trimesh(vertices=hull_vertices, faces=hull_triangles)
+
+    target_inside_hull_mask = hull_mesh.contains(target_pts_in_submesh)
+    target_points_inside_hull = target_pts_in_submesh[target_inside_hull_mask]
+
+    target_submesh_pcd = o3d.geometry.PointCloud()
+    target_submesh_pcd.points = o3d.utility.Vector3dVector(target_pts_in_submesh)
+
+    colors = np.zeros((len(target_pts_in_submesh), 3), dtype=np.float32)
+    colors[target_inside_hull_mask] = [1.0, 0.0, 0.0]
+    colors[~target_inside_hull_mask] = [0.7, 0.7, 0.7]
+
+    target_submesh_pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    print(
+        f"Submesh {i}: Found {len(target_points_inside_hull)} target points inside green hull (colored red) out of {len(target_pts_in_submesh)} total target points in submesh"
+    )
+    o3d.visualization.draw_geometries([target_submesh_pcd])
