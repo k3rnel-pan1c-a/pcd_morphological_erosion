@@ -5,8 +5,9 @@ import os
 import trimesh
 import cv2
 from sklearn.cluster import DBSCAN
+from sklearn.cluster import MeanShift, estimate_bandwidth
 
-PATH_SOURCE = "produced_mesh/scaled_pcd_dataset.ply"
+PATH_SOURCE = "produced_mesh_ninety_imgs/scaled_pcd_dataset.ply"
 PATH_TARGET = "../dataset/exported_blades_v3/28_01_2024_09_55/med_scaled.ply"
 BASE_DIR = "../dataset/exported_blades_v3/28_01_2024_09_55"
 
@@ -212,7 +213,9 @@ for i, submesh in enumerate(submeshes):
 
     green_mask = (H >= 35) & (H <= 85) & (S >= 60) & (V >= 40)
     if len(xyz_filtered[green_mask]) == 0:
+        # No green points probably a double cutter.
         continue
+
     db = DBSCAN(eps=0.008, min_samples=40).fit(xyz_filtered[green_mask])
     labels = db.labels_
     is_outlier = labels == -1
@@ -258,16 +261,77 @@ for i, submesh in enumerate(submeshes):
     target_inside_hull_mask = hull_mesh.contains(target_pts_in_submesh)
     target_points_inside_hull = target_pts_in_submesh[target_inside_hull_mask]
 
+    # If no target points found inside hull, perform ICP alignment
+    if len(target_points_inside_hull) == 0:
+        print(f"Submesh {i}: No target points inside hull, performing ICP alignment...")
+
+        source_submesh_pcd = o3d.geometry.PointCloud()
+        source_submesh_pcd.points = o3d.utility.Vector3dVector(xyz_filtered)
+
+        target_submesh_pcd_icp = o3d.geometry.PointCloud()
+        target_submesh_pcd_icp.points = o3d.utility.Vector3dVector(
+            target_pts_in_submesh
+        )
+
+        distance_threshold = 0.01
+        icp_result = o3d.pipelines.registration.registration_icp(
+            source_submesh_pcd,
+            target_submesh_pcd_icp,
+            distance_threshold,
+            np.identity(4),
+            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        )
+
+        print(
+            f"Submesh {i}: ICP fitness: {icp_result.fitness:.4f}, RMSE: {icp_result.inlier_rmse:.6f}"
+        )
+
+        hull_transformed = copy.deepcopy(hull)
+        hull_transformed.transform(icp_result.transformation)
+
+        green_xyz_transformed = np.asarray(green_pcd.points).copy()
+        green_xyz_homogeneous = np.hstack(
+            [green_xyz_transformed, np.ones((len(green_xyz_transformed), 1))]
+        )
+        green_xyz_transformed = (icp_result.transformation @ green_xyz_homogeneous.T).T[
+            :, :3
+        ]
+
+        hull_vertices_transformed = np.asarray(hull_transformed.vertices)
+        hull_triangles = np.asarray(hull_transformed.triangles)
+        hull_mesh_transformed = trimesh.Trimesh(
+            vertices=hull_vertices_transformed, faces=hull_triangles
+        )
+
+        target_inside_hull_mask = hull_mesh_transformed.contains(target_pts_in_submesh)
+        target_points_inside_hull = target_pts_in_submesh[target_inside_hull_mask]
+
+        print(
+            f"Submesh {i}: After ICP alignment, found {len(target_points_inside_hull)} target points inside hull"
+        )
+
+        source_vis = copy.deepcopy(source_submesh_pcd)
+        source_vis.transform(icp_result.transformation)
+        source_vis.paint_uniform_color([0.0, 1.0, 0.0])  # Green for aligned source
+
+        target_vis = copy.deepcopy(target_submesh_pcd_icp)
+        target_vis.paint_uniform_color([0.0, 0.0, 1.0])  # Blue for target
+
+        print(
+            f"Submesh {i}: Showing ICP alignment - Green: aligned source, Blue: target"
+        )
+        o3d.visualization.draw_geometries([source_vis, target_vis])
+
     target_submesh_pcd = o3d.geometry.PointCloud()
     target_submesh_pcd.points = o3d.utility.Vector3dVector(target_pts_in_submesh)
 
     colors = np.zeros((len(target_pts_in_submesh), 3), dtype=np.float32)
-    colors[target_inside_hull_mask] = [1.0, 0.0, 0.0]
-    colors[~target_inside_hull_mask] = [0.7, 0.7, 0.7]
+    colors[target_inside_hull_mask] = [1.0, 0.0, 0.0]  # Red for points inside hull
+    colors[~target_inside_hull_mask] = [0.7, 0.7, 0.7]  # Gray for other points
 
     target_submesh_pcd.colors = o3d.utility.Vector3dVector(colors)
 
     print(
-        f"Submesh {i}: Found {len(target_points_inside_hull)} target points inside green hull (colored red) out of {len(target_pts_in_submesh)} total target points in submesh"
+        f"Submesh {i}: Found {len(target_points_inside_hull)} target points inside hull (colored red) out of {len(target_pts_in_submesh)} total target points in submesh"
     )
     o3d.visualization.draw_geometries([target_submesh_pcd])
