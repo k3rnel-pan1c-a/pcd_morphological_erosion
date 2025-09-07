@@ -5,11 +5,15 @@ import os
 import trimesh
 import cv2
 from sklearn.cluster import DBSCAN
-from sklearn.cluster import MeanShift, estimate_bandwidth
+from scipy.spatial.distance import pdist
+
 
 PATH_SOURCE = "produced_mesh_ninety_imgs/scaled_pcd_dataset.ply"
 PATH_TARGET = "../dataset/exported_blades_v3/28_01_2024_09_55/med_scaled.ply"
 BASE_DIR = "../dataset/exported_blades_v3/28_01_2024_09_55"
+# PATH_SOURCE = "produced_mesh_3/scaled_pcd_dataset.ply"
+# PATH_TARGET = "../dataset/exported_blades_v3/01_02_2024_11_21/med_scaled.ply"
+# BASE_DIR = "../dataset/exported_blades_v3/01_02_2024_11_21"
 
 
 def draw_registration_result(source, target, transformation):
@@ -20,10 +24,6 @@ def draw_registration_result(source, target, transformation):
     source_temp.transform(transformation)
     o3d.visualization.draw_geometries(
         [source_temp, target_temp],
-        # zoom=0.4559,
-        # # front=[0.6452, -0.3036, -0.7011],
-        # # lookat=[1.9892, 2.0208, 1.8945],
-        # # up=[-0.2779, -0.9482, 0.1556],
     )
 
 
@@ -96,8 +96,7 @@ def execute_global_registration(
     return result
 
 
-def refine_registration(source, target, source_fpfh, target_fpfh, voxel_size):
-    distance_threshold = voxel_size * 0.4
+def refine_registration(source, target, distance_threshold):
     print(":: Point-to-plane ICP registration is applied on original point")
     print("   clouds to refine the alignment. This time we use a strict")
     print("   distance threshold %.3f." % distance_threshold)
@@ -123,7 +122,8 @@ result_ransac = execute_global_registration(
 print(result_ransac)
 draw_registration_result(source_down, target_down, result_ransac.transformation)
 
-result_icp = refine_registration(source, target, source_fpfh, target_fpfh, voxel_size)
+distance_threshold = voxel_size * 0.4
+result_icp = refine_registration(source, target, distance_threshold)
 print(result_icp)
 draw_registration_result(source, target, result_icp.transformation)
 print(result_icp.transformation)
@@ -138,111 +138,158 @@ submeshes_centers = []
 submeshes_radii = []
 intersections = [[] for _ in range(len(submeshes))]
 
-submesh_points = []
-for submesh in submeshes:
-    mask = submesh.contains(transformed_source_pts)
-    xyz = transformed_source_pts[mask]
-    submesh_points.append(xyz)
-
-for submesh in submeshes:
-    center = np.mean(submesh.vertices, axis=0)
-    radius = ((submesh.vertices - center) ** 2).sum(axis=1).max() ** 0.5
-    submeshes_centers.append(center)
-    submeshes_radii.append(radius)
-
-
-for i in range(len(submeshes)):
-    ci = submeshes_centers[i]
-    ri = submeshes_radii[i]
-    for j in range(len(submeshes)):
-        if i == j:
-            continue
-        cj = submeshes_centers[j]
-        rj = submeshes_radii[j]
-
-        if np.linalg.norm(ci - cj) < ri + rj:
-            intersections[i].append(j)
-
 
 for i, submesh in enumerate(submeshes):
     mask = submesh.contains(transformed_source_pts)
     xyz_original = transformed_source_pts[mask]
 
+    rgb_original = np.asarray(transformed_source.colors, dtype=np.float32)[mask]
+
+    rgb_u8_original = (rgb_original * 255).astype(np.uint8)
+    hsv = cv2.cvtColor(rgb_u8_original.reshape(-1, 1, 3), cv2.COLOR_RGB2HSV).reshape(
+        -1, 3
+    )
+
+    H, S, V = (
+        hsv[:, 0],
+        hsv[:, 1],
+        hsv[:, 2],
+    )
+
+    green_mask_original = (H >= 35) & (H <= 85) & (S >= 60) & (V >= 40)
+
+    if np.sum(green_mask_original) > 0:
+        green_points_original = xyz_original[green_mask_original]
+
+        print(f"Submesh {i}: Displaying original point cloud with green colored points")
+        original_pcd = o3d.geometry.PointCloud()
+        original_pcd.points = o3d.utility.Vector3dVector(xyz_original)
+
+        original_pcd_colors = np.zeros((len(xyz_original), 3), dtype=np.float32)
+        original_pcd_colors[green_mask_original] = [0.0, 1.0, 0.0]
+        original_pcd_colors[~green_mask_original] = [0.7, 0.7, 0.7]
+
+        original_pcd.colors = o3d.utility.Vector3dVector(original_pcd_colors)
+
+        o3d.visualization.draw_geometries([original_pcd])
+
+        print(
+            f"Submesh {i}: Applying DBSCAN clustering to {len(green_points_original)} green points from original"
+        )
+
+        db = DBSCAN(eps=0.008, min_samples=40).fit(green_points_original)
+        cluster_labels = db.labels_
+
+        is_outlier = cluster_labels == -1
+        green_points_inliers = green_points_original[~is_outlier]
+        cluster_labels_inliers = cluster_labels[~is_outlier]
+
+        n_clusters = len(np.unique(cluster_labels_inliers))
+        n_outliers = np.sum(is_outlier)
+
+        print(f"Submesh {i}: Found {n_clusters} green clusters, {n_outliers} outliers")
+
+        if len(green_points_inliers) > 0:
+            green_colors = np.zeros((len(green_points_inliers), 3))
+            unique_labels = np.unique(cluster_labels_inliers)
+
+            cluster_info = []
+            spheres = []
+
+            for idx, label in enumerate(unique_labels):
+                cluster_mask = cluster_labels_inliers == label
+                cluster_points = green_points_inliers[cluster_mask]
+
+                np.random.seed(42)
+                color = np.random.rand(3)
+                green_colors[cluster_mask] = color
+
+                # Calculate cluster center
+                cluster_center = np.mean(cluster_points, axis=0)
+
+                # Calculate diameter (maximum pairwise distance)
+                distances = pdist(cluster_points)
+                diameter = np.max(distances)
+                radius = diameter / 2.0
+
+                cluster_info.append(
+                    {
+                        "center": cluster_center,
+                        "radius": radius,
+                    }
+                )
+
+                # Create sphere at cluster center with radius
+                sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+                sphere.translate(cluster_center)
+                sphere.paint_uniform_color(color)
+                spheres.append(sphere)
+
+                print(
+                    f"Submesh {i}, Cluster {label}: Center={cluster_center}, Diameter={diameter:.4f}, Radius={radius:.4f}, Points={len(cluster_points)}"
+                )
+
+            context_pcd = o3d.geometry.PointCloud()
+            context_pcd.points = o3d.utility.Vector3dVector(xyz_original)
+
+            context_colors = np.full((len(xyz_original), 3), 0.7)
+
+            # Map cluster colors back to original green points
+            green_indices = np.where(green_mask_original)[0]
+            inlier_indices = green_indices[~is_outlier]
+
+            for i_inlier, original_idx in enumerate(inlier_indices):
+                context_colors[original_idx] = green_colors[i_inlier]
+
+            context_pcd.colors = o3d.utility.Vector3dVector(context_colors)
+
+            geometries = [context_pcd] + spheres
+
+            o3d.visualization.draw_geometries(geometries)
+
+        else:
+            print(f"Submesh {i}: All green points were outliers")
+            continue
+    else:
+        print(f"Submesh {i}: No green points found in original points")
+        continue
+
     points_to_keep = np.ones(len(xyz_original), dtype=bool)
 
-    for intersecting_idx in intersections[i]:
-        intersecting_submesh = submeshes[intersecting_idx]
-        intersecting_mask = intersecting_submesh.contains(xyz_original)
-        points_to_keep = points_to_keep & ~intersecting_mask
+    # Find the sphere closest to the submesh center
+    if len(cluster_info) > 0:
+        submesh_center = np.mean(submesh.vertices, axis=0)
+
+        # Calculate distances from submesh center to each sphere center
+        distances_to_submesh = []
+        for info in cluster_info:
+            distance = np.linalg.norm(info["center"] - submesh_center)
+            distances_to_submesh.append(distance)
+
+        # Find the closest sphere
+        closest_sphere_idx = np.argmin(distances_to_submesh)
+        closest_sphere = cluster_info[closest_sphere_idx]
+
+        print(
+            f"Submesh {i}: Closest sphere to submesh center is at {closest_sphere['center']} with radius {closest_sphere['radius']:.4f}"
+        )
+
+        sphere_center = closest_sphere["center"]
+        sphere_radius = closest_sphere["radius"]
+
+        distances_to_sphere = np.linalg.norm(xyz_original - sphere_center, axis=1)
+        points_to_keep = distances_to_sphere <= sphere_radius
+
+        print(
+            f"Submesh {i}: Keeping {np.sum(points_to_keep)} out of {len(xyz_original)} points inside closest sphere"
+        )
+    else:
+        print(f"Submesh {i}: No spheres found, keeping all points")
 
     xyz_filtered = xyz_original[points_to_keep]
 
-    if len(xyz_filtered) == 0:
-        print(f"Submesh {i}: No points remaining after removing intersections")
-        original_pcd = o3d.geometry.PointCloud()
-        original_pcd.points = o3d.utility.Vector3dVector(xyz_original)
-        original_pcd.paint_uniform_color([0.0, 0.0, 1.0])  # Blue
-        print(f"Submesh {i}: Original points ({len(xyz_original)}) - All removed")
-        o3d.visualization.draw_geometries([original_pcd])
-        continue
-
-    bounds = xyz_original.max(axis=0) - xyz_original.min(axis=0)
-    x_offset = bounds[0] * 1.5
-
-    original_pcd = o3d.geometry.PointCloud()
-    original_pcd.points = o3d.utility.Vector3dVector(xyz_original)
-    original_pcd.paint_uniform_color([0.0, 0.0, 1.0])
-
-    xyz_filtered_offset = xyz_filtered.copy()
-    xyz_filtered_offset[:, 0] += x_offset
-
-    filtered_pcd = o3d.geometry.PointCloud()
-    filtered_pcd.points = o3d.utility.Vector3dVector(xyz_filtered_offset)
-    filtered_pcd.paint_uniform_color([1.0, 0.0, 0.0])
-
-    print(
-        f"Submesh {i}: Left (Blue) = Original ({len(xyz_original)}), Right (Red) = After removal ({len(xyz_filtered)})"
-    )
-    o3d.visualization.draw_geometries([original_pcd, filtered_pcd])
-
-    rgb = np.asarray(transformed_source.colors, dtype=np.float32)[mask][points_to_keep]
-
-    rgb_u8 = (rgb * 255).astype(np.uint8)
-    hsv = cv2.cvtColor(rgb_u8.reshape(-1, 1, 3), cv2.COLOR_RGB2HSV).reshape(-1, 3)
-    H, S, V = hsv[:, 0], hsv[:, 1], hsv[:, 2]
-
-    green_mask = (H >= 35) & (H <= 85) & (S >= 60) & (V >= 40)
-    if len(xyz_filtered[green_mask]) == 0:
-        # No green points probably a double cutter.
-        continue
-
-    db = DBSCAN(eps=0.008, min_samples=40).fit(xyz_filtered[green_mask])
-    labels = db.labels_
-    is_outlier = labels == -1
-
-    green_inliers_mask = np.zeros(len(xyz_filtered), dtype=bool)
-    green_indices = np.where(green_mask)[0]
-    green_inliers_indices = green_indices[~is_outlier]
-    green_inliers_mask[green_inliers_indices] = True
-
-    green_xyz_filtered = xyz_filtered[green_inliers_mask]
-
-    filtered_pcd = o3d.geometry.PointCloud()
-    filtered_pcd.points = o3d.utility.Vector3dVector(xyz_filtered)
-
-    colors = np.zeros((len(xyz_filtered), 3), dtype=np.float32)
-
-    colors[green_inliers_mask] = [0.0, 1.0, 0.0]
-    colors[~green_inliers_mask] = [0.7, 0.7, 0.7]
-    filtered_pcd.colors = o3d.utility.Vector3dVector(colors)
-
-    print(f"Submesh {i}: Green detection on filtered points")
-    o3d.visualization.draw_geometries([filtered_pcd])
-
-    if len(green_xyz_filtered) == 0:
-        continue
     green_pcd = o3d.geometry.PointCloud()
-    green_pcd.points = o3d.utility.Vector3dVector(green_xyz_filtered)
+    green_pcd.points = o3d.utility.Vector3dVector(xyz_filtered)
 
     hull, _ = green_pcd.compute_convex_hull()
 
@@ -250,84 +297,63 @@ for i, submesh in enumerate(submeshes):
     target_in_submesh_mask = submesh.contains(target_pts)
     target_pts_in_submesh = target_pts[target_in_submesh_mask]
 
-    if len(target_pts_in_submesh) == 0:
-        print(f"Submesh {i}: No target points found in submesh")
-        continue
+    source_submesh_pcd_icp = o3d.geometry.PointCloud()
+    source_submesh_pcd_icp.points = o3d.utility.Vector3dVector(xyz_original)
 
-    hull_vertices = np.asarray(hull.vertices)
+    target_submesh_pcd_icp = o3d.geometry.PointCloud()
+    target_submesh_pcd_icp.points = o3d.utility.Vector3dVector(target_pts_in_submesh)
+
+    distance_threshold = 0.01
+
+    icp_result = o3d.pipelines.registration.registration_icp(
+        source_submesh_pcd_icp,
+        target_submesh_pcd_icp,
+        distance_threshold,
+        np.identity(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+    )
+
+    print(
+        f"Submesh {i}: ICP fitness: {icp_result.fitness:.4f}, RMSE: {icp_result.inlier_rmse:.6f}"
+    )
+
+    hull.transform(icp_result.transformation)
+
+    green_xyz_transformed = np.asarray(green_pcd.points).copy()
+    green_xyz_homogeneous = np.hstack(
+        [green_xyz_transformed, np.ones((len(green_xyz_transformed), 1))]
+    )
+    green_xyz_transformed = (green_xyz_homogeneous @ icp_result.transformation)[:, :3]
+
+    hull_vertices_transformed = np.asarray(hull.vertices)
     hull_triangles = np.asarray(hull.triangles)
-    hull_mesh = trimesh.Trimesh(vertices=hull_vertices, faces=hull_triangles)
+    hull_mesh_transformed = trimesh.Trimesh(
+        vertices=hull_vertices_transformed, faces=hull_triangles
+    )
 
-    target_inside_hull_mask = hull_mesh.contains(target_pts_in_submesh)
+    target_inside_hull_mask = hull_mesh_transformed.contains(target_pts_in_submesh)
     target_points_inside_hull = target_pts_in_submesh[target_inside_hull_mask]
 
-    # If no target points found inside hull, perform ICP alignment
-    if len(target_points_inside_hull) == 0:
-        print(f"Submesh {i}: No target points inside hull, performing ICP alignment...")
+    print(
+        f"Submesh {i}: After ICP alignment, found {len(target_points_inside_hull)} target points inside hull"
+    )
 
-        source_submesh_pcd = o3d.geometry.PointCloud()
-        source_submesh_pcd.points = o3d.utility.Vector3dVector(xyz_filtered)
+    source_vis = copy.deepcopy(source_submesh_pcd_icp)
+    source_vis.transform(icp_result.transformation)
+    source_vis.paint_uniform_color([1.0, 0.0, 0.0])
 
-        target_submesh_pcd_icp = o3d.geometry.PointCloud()
-        target_submesh_pcd_icp.points = o3d.utility.Vector3dVector(
-            target_pts_in_submesh
-        )
+    target_vis = copy.deepcopy(target_submesh_pcd_icp)
+    target_vis.paint_uniform_color([0.0, 0.0, 1.0])
 
-        distance_threshold = 0.01
-        icp_result = o3d.pipelines.registration.registration_icp(
-            source_submesh_pcd,
-            target_submesh_pcd_icp,
-            distance_threshold,
-            np.identity(4),
-            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-        )
-
-        print(
-            f"Submesh {i}: ICP fitness: {icp_result.fitness:.4f}, RMSE: {icp_result.inlier_rmse:.6f}"
-        )
-
-        hull_transformed = copy.deepcopy(hull)
-        hull_transformed.transform(icp_result.transformation)
-
-        green_xyz_transformed = np.asarray(green_pcd.points).copy()
-        green_xyz_homogeneous = np.hstack(
-            [green_xyz_transformed, np.ones((len(green_xyz_transformed), 1))]
-        )
-        green_xyz_transformed = (icp_result.transformation @ green_xyz_homogeneous.T).T[
-            :, :3
-        ]
-
-        hull_vertices_transformed = np.asarray(hull_transformed.vertices)
-        hull_triangles = np.asarray(hull_transformed.triangles)
-        hull_mesh_transformed = trimesh.Trimesh(
-            vertices=hull_vertices_transformed, faces=hull_triangles
-        )
-
-        target_inside_hull_mask = hull_mesh_transformed.contains(target_pts_in_submesh)
-        target_points_inside_hull = target_pts_in_submesh[target_inside_hull_mask]
-
-        print(
-            f"Submesh {i}: After ICP alignment, found {len(target_points_inside_hull)} target points inside hull"
-        )
-
-        source_vis = copy.deepcopy(source_submesh_pcd)
-        source_vis.transform(icp_result.transformation)
-        source_vis.paint_uniform_color([0.0, 1.0, 0.0])  # Green for aligned source
-
-        target_vis = copy.deepcopy(target_submesh_pcd_icp)
-        target_vis.paint_uniform_color([0.0, 0.0, 1.0])  # Blue for target
-
-        print(
-            f"Submesh {i}: Showing ICP alignment - Green: aligned source, Blue: target"
-        )
-        o3d.visualization.draw_geometries([source_vis, target_vis])
+    print(f"Submesh {i}: Showing ICP alignment - Red: aligned source, Blue: target")
+    o3d.visualization.draw_geometries([source_vis, target_vis])
 
     target_submesh_pcd = o3d.geometry.PointCloud()
     target_submesh_pcd.points = o3d.utility.Vector3dVector(target_pts_in_submesh)
 
     colors = np.zeros((len(target_pts_in_submesh), 3), dtype=np.float32)
-    colors[target_inside_hull_mask] = [1.0, 0.0, 0.0]  # Red for points inside hull
-    colors[~target_inside_hull_mask] = [0.7, 0.7, 0.7]  # Gray for other points
+    colors[target_inside_hull_mask] = [1.0, 0.0, 0.0]
+    colors[~target_inside_hull_mask] = [0.7, 0.7, 0.7]
 
     target_submesh_pcd.colors = o3d.utility.Vector3dVector(colors)
 
